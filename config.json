@@ -1,0 +1,10 @@
+{
+  "pivot_n": 3,
+  "atr_period": 14,
+  "atr_mult": 0.25,
+  "symbols": {
+    "RELIANCE.NS": { "result_dates": ["2026-11-25"] },
+    "TCS.NS": { "result_dates": [] },
+    "INFY.NS": { "result_dates": [] }
+  }
+}
