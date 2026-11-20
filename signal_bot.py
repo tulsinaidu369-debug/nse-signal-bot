@@ -1,4 +1,4 @@
-import json, os, sys
+import io, json, os, sys, time
 import numpy as np
 import pandas as pd
 import requests
@@ -7,20 +7,92 @@ import yfinance as yf
 CFG = json.load(open("config.json"))
 N = CFG["pivot_n"]; ATR_P = CFG["atr_period"]; MULT = CFG["atr_mult"]
 STATE_FILE = "state.json"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+N500_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+TODAY = pd.Timestamp.now(tz="Asia/Kolkata").date().isoformat()
 
 
-def load(sym):
-    df = yf.download(sym, period="59d", interval="15m",
-                     auto_adjust=False, progress=False)
-    if df is None or df.empty:
-        return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df[["Open", "High", "Low", "Close"]].dropna()
-    df.index = df.index.tz_convert("Asia/Kolkata")
+def notify(text):
+    print(text, "\n")
+    tok, chat = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if tok and chat:
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                              data={"chat_id": chat, "text": text}, timeout=20)
+            if not r.ok:
+                print("Telegram error:", r.text, file=sys.stderr)
+        except Exception as ex:
+            print("Telegram error:", ex, file=sys.stderr)
+        time.sleep(0.4)
+
+
+def fetch_universe():
+    r = requests.get(N500_URL, headers={"User-Agent": UA}, timeout=30)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    syms = [str(s).strip() for s in df["Symbol"].dropna()]
+    if len(syms) < 300:
+        raise ValueError("NSE500 list chhoti aayi")
+    return syms
+
+
+def fetch_results_calendar():
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+    s.get("https://www.nseindia.com", timeout=30)
+    t = pd.Timestamp.now(tz="Asia/Kolkata")
+    f = (t - pd.Timedelta(days=3)).strftime("%d-%m-%Y")
+    e = (t + pd.Timedelta(days=5)).strftime("%d-%m-%Y")
+    url = ("https://www.nseindia.com/api/event-calendar"
+           f"?index=equities&from_date={f}&to_date={e}")
+    r = s.get(url, headers={
+        "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-event-calendar",
+        "Accept": "application/json"}, timeout=40)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict):
+        data = data.get("data", [])
+    out = {}
+    for row in data:
+        txt = (str(row.get("purpose", "")) + " " + str(row.get("bm_desc", ""))).lower()
+        if "result" not in txt:
+            continue
+        d = pd.to_datetime(row.get("date") or row.get("bm_date"),
+                           dayfirst=True, errors="coerce")
+        sym = row.get("symbol")
+        if sym and not pd.isna(d):
+            out.setdefault(sym, []).append(d.date().isoformat())
+    if not out:
+        raise ValueError("Calendar khali aaya")
+    return out
+
+
+def load_many(syms):
+    out = {}
     now = pd.Timestamp.now(tz="Asia/Kolkata")
-    df = df[df.index + pd.Timedelta(minutes=15) <= now]
-    return df
+    for i in range(0, len(syms), 100):
+        chunk = [s + ".NS" for s in syms[i:i + 100]]
+        try:
+            raw = yf.download(chunk, period="59d", interval="15m",
+                              group_by="ticker", auto_adjust=False,
+                              progress=False, threads=True)
+        except Exception as ex:
+            print("download error:", ex, file=sys.stderr); continue
+        for t in chunk:
+            try:
+                d = raw[t][["Open", "High", "Low", "Close"]].dropna()
+            except Exception:
+                continue
+            if d.empty:
+                continue
+            if d.index.tz is None:
+                d.index = d.index.tz_localize("UTC")
+            d.index = d.index.tz_convert("Asia/Kolkata")
+            d = d[d.index + pd.Timedelta(minutes=15) <= now]
+            if len(d) >= 3 * N + ATR_P:
+                out[t[:-3]] = d
+    return out
 
 
 def atr(df):
@@ -109,24 +181,43 @@ def run(df, sym, result_dates):
     return ev
 
 
-def notify(text):
-    print(text, "\n")
-    tok, chat = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if tok and chat:
-        r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                          data={"chat_id": chat, "text": text}, timeout=20)
-        if not r.ok:
-            print("Telegram error:", r.text, file=sys.stderr)
-
-
 def main():
     state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
-    for sym, meta in CFG["symbols"].items():
+    warns = []
+
+    # NSE 500 list (roz ek baar)
+    if state.get("_n500", {}).get("date") != TODAY:
         try:
-            df = load(sym)
-            if df is None or len(df) < 3 * N + ATR_P:
-                print(f"{sym}: data kam/nahi mila"); continue
-            events = run(df, sym, set(meta.get("result_dates", [])))
+            state["_n500"] = {"date": TODAY, "syms": fetch_universe()}
+        except Exception as ex:
+            warns.append(f"NSE500 list nahi mili ({ex})")
+    universe = state.get("_n500", {}).get("syms") or \
+        [s.replace(".NS", "") for s in CFG.get("symbols", {})]
+
+    # Result calendar (roz ek baar)
+    if state.get("_cal", {}).get("date") != TODAY:
+        try:
+            state["_cal"] = {"date": TODAY, "dates": fetch_results_calendar()}
+        except Exception as ex:
+            warns.append(f"Result calendar nahi mila ({ex})")
+    cal = state.get("_cal", {}).get("dates", {})
+
+    if warns and state.get("_warn") != TODAY:
+        notify("⚠️ " + "; ".join(warns) + "\nPurani/manual dates se kaam chal raha hai.")
+        state["_warn"] = TODAY
+
+    # manual dates (config.json) bhi jod do
+    manual = {k.replace(".NS", ""): v.get("result_dates", [])
+              for k, v in CFG.get("symbols", {}).items()}
+
+    print(f"Universe: {len(universe)} | aaj result wale: "
+          f"{sum(TODAY in v for v in cal.values())}")
+
+    data = load_many(universe)
+    for sym, df in data.items():
+        try:
+            rd = set(cal.get(sym, [])) | set(manual.get(sym, []))
+            events = run(df, sym, rd)
             last_bar = df.index[-1].isoformat()
             seen = state.get(sym)
             for e in events:
