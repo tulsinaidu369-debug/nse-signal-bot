@@ -1,16 +1,18 @@
-import io, json, os, sys, time
+import json, os, sys, time
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
 
-CFG = json.load(open("config.json"))
-N = CFG["pivot_n"]; ATR_P = CFG["atr_period"]; MULT = CFG["atr_mult"]
+SYMS = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN"}
+N = 3            # pivot left/right candles
+ATR_P = 14
+MULT = 0.25      # SL buffer = 0.25 x ATR
+RR = 2.0         # target 1:2
+EQ_TOL = 0.10    # equal high/low tolerance (x ATR)
+MIN_GAP = 10     # equal levels ke beech min candles
+LOOKBACK = 100   # equal level dhundhne ki max candles
 STATE_FILE = "state.json"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-N500_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
-TODAY = pd.Timestamp.now(tz="Asia/Kolkata").date().isoformat()
 
 
 def notify(text):
@@ -27,72 +29,19 @@ def notify(text):
         time.sleep(0.4)
 
 
-def fetch_universe():
-    r = requests.get(N500_URL, headers={"User-Agent": UA}, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    syms = [str(s).strip() for s in df["Symbol"].dropna()]
-    if len(syms) < 300:
-        raise ValueError("NSE500 list chhoti aayi")
-    return syms
-
-
-def fetch_results_calendar():
-    s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
-    s.get("https://www.nseindia.com", timeout=30)
-    t = pd.Timestamp.now(tz="Asia/Kolkata")
-    f = (t - pd.Timedelta(days=3)).strftime("%d-%m-%Y")
-    e = (t + pd.Timedelta(days=5)).strftime("%d-%m-%Y")
-    url = ("https://www.nseindia.com/api/event-calendar"
-           f"?index=equities&from_date={f}&to_date={e}")
-    r = s.get(url, headers={
-        "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-event-calendar",
-        "Accept": "application/json"}, timeout=40)
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict):
-        data = data.get("data", [])
-    out = {}
-    for row in data:
-        txt = (str(row.get("purpose", "")) + " " + str(row.get("bm_desc", ""))).lower()
-        if "result" not in txt:
-            continue
-        d = pd.to_datetime(row.get("date") or row.get("bm_date"),
-                           dayfirst=True, errors="coerce")
-        sym = row.get("symbol")
-        if sym and not pd.isna(d):
-            out.setdefault(sym, []).append(d.date().isoformat())
-    if not out:
-        raise ValueError("Calendar khali aaya")
-    return out
-
-
-def load_many(syms):
-    out = {}
+def load(tk):
+    df = yf.download(tk, period="59d", interval="15m",
+                     auto_adjust=False, progress=False)
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df[["Open", "High", "Low", "Close"]].dropna()
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df.index = df.index.tz_convert("Asia/Kolkata")
     now = pd.Timestamp.now(tz="Asia/Kolkata")
-    for i in range(0, len(syms), 100):
-        chunk = [s + ".NS" for s in syms[i:i + 100]]
-        try:
-            raw = yf.download(chunk, period="59d", interval="15m",
-                              group_by="ticker", auto_adjust=False,
-                              progress=False, threads=True)
-        except Exception as ex:
-            print("download error:", ex, file=sys.stderr); continue
-        for t in chunk:
-            try:
-                d = raw[t][["Open", "High", "Low", "Close"]].dropna()
-            except Exception:
-                continue
-            if d.empty:
-                continue
-            if d.index.tz is None:
-                d.index = d.index.tz_localize("UTC")
-            d.index = d.index.tz_convert("Asia/Kolkata")
-            d = d[d.index + pd.Timedelta(minutes=15) <= now]
-            if len(d) >= 3 * N + ATR_P:
-                out[t[:-3]] = d
-    return out
+    return df[df.index + pd.Timedelta(minutes=15) <= now]  # sirf closed candles
 
 
 def atr(df):
@@ -103,130 +52,122 @@ def atr(df):
     return tr.ewm(alpha=1 / ATR_P, adjust=False).mean()
 
 
-def run(df, sym, result_dates):
+def run(df, name):
     o, h, l, c = (df[k].values for k in ["Open", "High", "Low", "Close"])
     a = atr(df).values
-    dates = [ts.date().isoformat() for ts in df.index]
-    highs, lows = [], []
-    pos, pending, used = None, None, set()
-    ev = []
+    day = np.array([ts.date().isoformat() for ts in df.index])
+    mins = np.array([ts.hour * 60 + ts.minute for ts in df.index])  # candle start
+    g = df.groupby(day)
+    dH, dL = g["High"].max(), g["Low"].min()
+    days = list(dH.index)
+    prev = {days[i]: days[i - 1] for i in range(1, len(days))}
+
+    levels, sw_h, sw_l = [], [], []
+    pos, cur, ev = None, None, []
 
     def add(t, kind, msg):
         ev.append({"ts": df.index[t].isoformat(), "kind": kind, "msg": msg})
 
     for t in range(len(df)):
-        if pending and pos is None:
-            side, sl0 = pending; pending = None
-            ok = (o[t] > sl0) if side == "LONG" else (o[t] < sl0)
-            if ok:
-                pos = {"side": side, "entry": o[t], "sl": sl0}
+        d = day[t]
+        if d != cur:                       # naya din: purane PDH/PDL hatao
+            cur = d
+            levels = [x for x in levels if x["kind"] == "EQ" and not x["dead"]]
+            if d in prev:
+                levels.append({"side": "LOW", "p": float(dL[prev[d]]), "kind": "PDL", "t0": t, "dead": False})
+                levels.append({"side": "HIGH", "p": float(dH[prev[d]]), "kind": "PDH", "t0": t, "dead": False})
 
+        # 1) open trade management (SL pehle, conservative)
         if pos:
-            if pos["side"] == "LONG" and l[t] <= pos["sl"]:
-                px = min(o[t], pos["sl"])
-                add(t, "EXIT", f"🔴 EXIT LONG {sym}\nPrice ~ {px:.2f} (SL hit)\nEntry tha {pos['entry']:.2f}")
-                pos = None
-            elif pos["side"] == "SHORT" and h[t] >= pos["sl"]:
-                px = max(o[t], pos["sl"])
-                add(t, "EXIT", f"🔴 EXIT SHORT {sym}\nPrice ~ {px:.2f} (SL hit)\nEntry tha {pos['entry']:.2f}")
+            s, sl, tp = pos["side"], pos["sl"], pos["tp"]
+            px = kind = None
+            if s == "BUY":
+                if l[t] <= sl: px, kind = min(o[t], sl), "SL"
+                elif h[t] >= tp: px, kind = max(o[t], tp), "TARGET"
+            else:
+                if h[t] >= sl: px, kind = max(o[t], sl), "SL"
+                elif l[t] <= tp: px, kind = min(o[t], tp), "TARGET"
+            if kind is None and mins[t] >= 15 * 60:   # 3:15 PM exit
+                px, kind = c[t], "TIME"
+            if kind:
+                pnl = (px - pos["entry"]) if s == "BUY" else (pos["entry"] - px)
+                label = {"SL": "🛑 SL HIT", "TARGET": "🎯 TARGET HIT", "TIME": "⏰ 3:15 EXIT"}[kind]
+                add(t, kind, f"{label} {s} {name}\nPrice ~ {px:.2f}\nEntry tha {pos['entry']:.2f}\nP/L: {pnl:+.1f} pts")
                 pos = None
 
-        new_low = new_high = False
+        # 2) pivots (right side N candle close hone ke baad confirm)
         i = t - N
-        if i >= N:
-            if h[i] > h[i - N:i].max() and h[i] >= h[i + 1:t + 1].max():
-                highs.append((i, h[i])); new_high = True
+        if i >= N and not np.isnan(a[t]):
             if l[i] < l[i - N:i].min() and l[i] <= l[i + 1:t + 1].min():
-                lows.append((i, l[i])); new_low = True
+                for j, pj in reversed(sw_l):
+                    if i - j > LOOKBACK: break
+                    if i - j >= MIN_GAP and abs(l[i] - pj) <= EQ_TOL * a[t]:
+                        lv = min(l[i], pj)
+                        if c[j + 1:t + 1].min() >= lv:
+                            levels.append({"side": "LOW", "p": float(lv), "kind": "EQ", "t0": t, "dead": False})
+                        break
+                sw_l.append((i, l[i]))
+            if h[i] > h[i - N:i].max() and h[i] >= h[i + 1:t + 1].max():
+                for j, pj in reversed(sw_h):
+                    if i - j > LOOKBACK: break
+                    if i - j >= MIN_GAP and abs(h[i] - pj) <= EQ_TOL * a[t]:
+                        lv = max(h[i], pj)
+                        if c[j + 1:t + 1].max() <= lv:
+                            levels.append({"side": "HIGH", "p": float(lv), "kind": "EQ", "t0": t, "dead": False})
+                        break
+                sw_h.append((i, h[i]))
 
-        if np.isnan(a[t]):
+        # 3) sweep check
+        buys = [x for x in levels if x["side"] == "LOW" and not x["dead"] and x["t0"] < t and l[t] < x["p"] and c[t] > x["p"]]
+        sells = [x for x in levels if x["side"] == "HIGH" and not x["dead"] and x["t0"] < t and h[t] > x["p"] and c[t] < x["p"]]
+        for x in buys + sells:
+            x["dead"] = True               # ek level ek hi baar
+        for x in levels:                   # close ke saath toot gaya = level khatam
+            if x["side"] == "LOW" and c[t] < x["p"]: x["dead"] = True
+            if x["side"] == "HIGH" and c[t] > x["p"]: x["dead"] = True
+
+        if pos or np.isnan(a[t]) or not (570 <= mins[t] <= 855):   # 9:30 se 2:30 PM close
             continue
-
-        if pos and pos["side"] == "LONG" and new_low and len(lows) >= 2 \
-                and lows[-1][1] > lows[-2][1]:
-            new = lows[-1][1] - MULT * a[t]
-            if new > pos["sl"]:
-                pos["sl"] = new
-                add(t, "TRAIL", f"🔼 TRAIL SL LONG {sym}\nNaya SL: {new:.2f}")
-        if pos and pos["side"] == "SHORT" and new_high and len(highs) >= 2 \
-                and highs[-1][1] < highs[-2][1]:
-            new = highs[-1][1] + MULT * a[t]
-            if new < pos["sl"]:
-                pos["sl"] = new
-                add(t, "TRAIL", f"🔽 TRAIL SL SHORT {sym}\nNaya SL: {new:.2f}")
-
-        if pos or pending or t < 1:
+        if bool(buys) == bool(sells):      # koi nahi ya dono: no trade
             continue
-        if dates[t] in result_dates:
-            continue
-
-        if highs and len(lows) >= 2:
-            sh, hl, prev = highs[-1], lows[-1], lows[-2]
-            key = ("L", sh[0], hl[0])
-            if hl[0] > sh[0] and hl[1] > prev[1] and key not in used \
-                    and c[t] > sh[1] and c[t - 1] <= sh[1]:
-                sl0 = hl[1] - MULT * a[t]
-                used.add(key); pending = ("LONG", sl0)
-                add(t, "BUY", f"🟢 BUY SIGNAL {sym}\n15m close {c[t]:.2f} > Swing High {sh[1]:.2f}\nEntry: NEXT candle open par\nSL: {sl0:.2f}")
-                continue
-
-        if lows and len(highs) >= 2:
-            sw, lh, prev = lows[-1], highs[-1], highs[-2]
-            key = ("S", sw[0], lh[0])
-            if lh[0] > sw[0] and lh[1] < prev[1] and key not in used \
-                    and c[t] < sw[1] and c[t - 1] >= sw[1]:
-                sl0 = lh[1] + MULT * a[t]
-                used.add(key); pending = ("SHORT", sl0)
-                add(t, "SELL", f"🔴 SELL SIGNAL {sym}\n15m close {c[t]:.2f} < Swing Low {sw[1]:.2f}\nEntry: NEXT candle open par\nSL: {sl0:.2f}")
+        if buys:
+            x = max(buys, key=lambda z: z["p"])
+            sl = l[t] - MULT * a[t]; risk = c[t] - sl
+            if risk <= 0: continue
+            tp = c[t] + RR * risk
+            pos = {"side": "BUY", "entry": c[t], "sl": sl, "tp": tp}
+            nm = {"PDL": "Prev Day Low", "EQ": "Equal Low"}[x["kind"]]
+            add(t, "ENTRY", f"🟢 BUY {name}\nSweep: {nm} {x['p']:.2f} (wick low {l[t]:.2f})\nEntry: {c[t]:.2f} (15m close)\nSL: {sl:.2f}\nTarget: {tp:.2f} (1:{RR:g})\nRisk: {risk:.1f} pts")
+        else:
+            x = min(sells, key=lambda z: z["p"])
+            sl = h[t] + MULT * a[t]; risk = sl - c[t]
+            if risk <= 0: continue
+            tp = c[t] - RR * risk
+            pos = {"side": "SELL", "entry": c[t], "sl": sl, "tp": tp}
+            nm = {"PDH": "Prev Day High", "EQ": "Equal High"}[x["kind"]]
+            add(t, "ENTRY", f"🔴 SELL {name}\nSweep: {nm} {x['p']:.2f} (wick high {h[t]:.2f})\nEntry: {c[t]:.2f} (15m close)\nSL: {sl:.2f}\nTarget: {tp:.2f} (1:{RR:g})\nRisk: {risk:.1f} pts")
     return ev
 
 
 def main():
-    state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
-    warns = []
-
-    # NSE 500 list (roz ek baar)
-    if state.get("_n500", {}).get("date") != TODAY:
+    old = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
+    state = {k: old[k] for k in SYMS if k in old}
+    for name, tk in SYMS.items():
         try:
-            state["_n500"] = {"date": TODAY, "syms": fetch_universe()}
-        except Exception as ex:
-            warns.append(f"NSE500 list nahi mili ({ex})")
-    universe = state.get("_n500", {}).get("syms") or \
-        [s.replace(".NS", "") for s in CFG.get("symbols", {})]
-
-    # Result calendar (roz ek baar)
-    if state.get("_cal", {}).get("date") != TODAY:
-        try:
-            state["_cal"] = {"date": TODAY, "dates": fetch_results_calendar()}
-        except Exception as ex:
-            warns.append(f"Result calendar nahi mila ({ex})")
-    cal = state.get("_cal", {}).get("dates", {})
-
-    if warns and state.get("_warn") != TODAY:
-        notify("⚠️ " + "; ".join(warns) + "\nPurani/manual dates se kaam chal raha hai.")
-        state["_warn"] = TODAY
-
-    # manual dates (config.json) bhi jod do
-    manual = {k.replace(".NS", ""): v.get("result_dates", [])
-              for k, v in CFG.get("symbols", {}).items()}
-
-    print(f"Universe: {len(universe)} | aaj result wale: "
-          f"{sum(TODAY in v for v in cal.values())}")
-
-    data = load_many(universe)
-    for sym, df in data.items():
-        try:
-            rd = set(cal.get(sym, [])) | set(manual.get(sym, []))
-            events = run(df, sym, rd)
+            df = load(tk)
+            if df is None or len(df) < 60:
+                print(f"{name}: data kam/nahi mila"); continue
+            events = run(df, name)
             last_bar = df.index[-1].isoformat()
-            seen = state.get(sym)
+            seen = state.get(name)
             for e in events:
                 fresh = e["ts"] > seen if seen else e["ts"] == last_bar
                 if fresh:
-                    notify(f"{e['msg']}\n🕒 {e['ts'][:16]}")
-            state[sym] = last_bar
+                    notify(f"{e['msg']}\n🕒 {e['ts'][:16].replace('T', ' ')}")
+            state[name] = last_bar
+            print(f"{name}: {len(df)} candles, last {last_bar[:16]}, events {len(events)}")
         except Exception as ex:
-            print(f"{sym}: error {ex}", file=sys.stderr)
+            print(f"{name}: error {ex}", file=sys.stderr)
     json.dump(state, open(STATE_FILE, "w"), indent=1)
 
 
